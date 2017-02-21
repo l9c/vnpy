@@ -11,6 +11,7 @@ vtSymbol直接使用symbol
 import os
 import json
 from copy import copy
+from datetime import datetime
 
 from vnctpmd import MdApi
 from vnctptd import TdApi
@@ -63,6 +64,13 @@ productClassMap[PRODUCT_OPTION] = defineDict["THOST_FTDC_PC_Options"]
 productClassMap[PRODUCT_COMBINATION] = defineDict["THOST_FTDC_PC_Combination"]
 productClassMapReverse = {v:k for k,v in productClassMap.items()}
 
+# 委托状态映射
+statusMap = {}
+statusMap[STATUS_ALLTRADED] = defineDict["THOST_FTDC_OST_AllTraded"]
+statusMap[STATUS_PARTTRADED] = defineDict["THOST_FTDC_OST_PartTradedQueueing"]
+statusMap[STATUS_NOTTRADED] = defineDict["THOST_FTDC_OST_NoTradeQueueing"]
+statusMap[STATUS_CANCELLED] = defineDict["THOST_FTDC_OST_Canceled"]
+statusMapReverse = {v:k for k,v in statusMap.items()}
 
 
 ########################################################################
@@ -87,7 +95,8 @@ class CtpGateway(VtGateway):
         """连接"""
         # 载入json文件
         fileName = self.gatewayName + '_connect.json'
-        fileName = os.getcwd() + '/ctpGateway/' + fileName
+        path = os.path.abspath(os.path.dirname(__file__))
+        fileName = os.path.join(path, fileName)
         
         try:
             f = file(fileName)
@@ -330,7 +339,10 @@ class CtpMdApi(MdApi):
         tick.volume = data['Volume']
         tick.openInterest = data['OpenInterest']
         tick.time = '.'.join([data['UpdateTime'], str(data['UpdateMillisec']/100)])
-        tick.date = data['TradingDay']
+        
+        # 这里由于交易所夜盘时段的交易日数据有误，所以选择本地获取
+        #tick.date = data['TradingDay']
+        tick.date = datetime.now().strftime('%Y%m%d')   
         
         tick.openPrice = data['OpenPrice']
         tick.highPrice = data['HighestPrice']
@@ -658,10 +670,15 @@ class CtpTdApi(TdApi):
         exchange = self.symbolExchangeDict.get(data['InstrumentID'], EXCHANGE_UNKNOWN)
         size = self.symbolSizeDict.get(data['InstrumentID'], 1)
         if exchange == EXCHANGE_SHFE:
-            pos = posBuffer.updateShfeBuffer(data, size)
+            posBuffer.updateShfeBuffer(data, size)
         else:
-            pos = posBuffer.updateBuffer(data, size)
-        self.gateway.onPosition(pos)
+            posBuffer.updateBuffer(data, size)
+            
+        # 所有持仓数据都更新后，再将缓存中的持仓情况发送到事件引擎中
+        if last:
+            for buf in self.posBufferDict.values():
+                pos = buf.getPos()
+                self.gateway.onPosition(pos)
         
     #----------------------------------------------------------------------
     def onRspQryTradingAccount(self, data, error, n, last):
@@ -929,34 +946,15 @@ class CtpTdApi(TdApi):
         order.vtSymbol = order.symbol #'.'.join([order.symbol, order.exchange])
         
         order.orderID = data['OrderRef']
+        # CTP的报单号一致性维护需要基于frontID, sessionID, orderID三个字段
+        # 但在本接口设计中，已经考虑了CTP的OrderRef的自增性，避免重复
+        # 唯一可能出现OrderRef重复的情况是多处登录并在非常接近的时间内（几乎同时发单）
+        # 考虑到VtTrader的应用场景，认为以上情况不会构成问题
+        order.vtOrderID = '.'.join([self.gatewayName, order.orderID])        
         
-        # 方向
-        if data['Direction'] == '0':
-            order.direction = DIRECTION_LONG
-        elif data['Direction'] == '1':
-            order.direction = DIRECTION_SHORT
-        else:
-            order.direction = DIRECTION_UNKNOWN
-            
-        # 开平
-        if data['CombOffsetFlag'] == '0':
-            order.offset = OFFSET_OPEN
-        elif data['CombOffsetFlag'] == '1':
-            order.offset = OFFSET_CLOSE
-        else:
-            order.offset = OFFSET_UNKNOWN
-            
-        # 状态
-        if data['OrderStatus'] == '0':
-            order.status = STATUS_ALLTRADED
-        elif data['OrderStatus'] == '1':
-            order.status = STATUS_PARTTRADED
-        elif data['OrderStatus'] == '3':
-            order.status = STATUS_NOTTRADED
-        elif data['OrderStatus'] == '5':
-            order.status = STATUS_CANCELLED
-        else:
-            order.status = STATUS_UNKNOWN
+        order.direction = directionMapReverse.get(data['Direction'], DIRECTION_UNKNOWN)
+        order.offset = offsetMapReverse.get(data['CombOffsetFlag'], OFFSET_UNKNOWN)
+        order.status = statusMapReverse.get(data['OrderStatus'], STATUS_UNKNOWN)            
             
         # 价格、报单量等数值
         order.price = data['LimitPrice']
@@ -966,12 +964,6 @@ class CtpTdApi(TdApi):
         order.cancelTime = data['CancelTime']
         order.frontID = data['FrontID']
         order.sessionID = data['SessionID']
-        
-        # CTP的报单号一致性维护需要基于frontID, sessionID, orderID三个字段
-        # 但在本接口设计中，已经考虑了CTP的OrderRef的自增性，避免重复
-        # 唯一可能出现OrderRef重复的情况是多处登录并在非常接近的时间内（几乎同时发单）
-        # 考虑到VtTrader的应用场景，认为以上情况不会构成问题
-        order.vtOrderID = '.'.join([self.gatewayName, order.orderID])
         
         # 推送
         self.gateway.onOrder(order)
@@ -1251,7 +1243,6 @@ class CtpTdApi(TdApi):
         """"""
         pass
         
-
     #----------------------------------------------------------------------
     def connect(self, userID, password, brokerID, address):
         """初始化连接"""
@@ -1267,6 +1258,10 @@ class CtpTdApi(TdApi):
             if not os.path.exists(path):
                 os.makedirs(path)
             self.createFtdcTraderApi(path)
+            
+            # 设置数据同步模式为推送从今日开始所有数据
+            self.subscribePrivateTopic(0)
+            self.subscribePublicTopic(0)            
             
             # 注册服务器地址
             self.registerFront(self.address)
@@ -1440,6 +1435,11 @@ class PositionBuffer(object):
             self.pos.price = 0
             
         return copy(self.pos)    
+    
+    #----------------------------------------------------------------------
+    def getPos(self):
+        """获取当前的持仓数据"""
+        return copy(self.pos)
 
 
 #----------------------------------------------------------------------
